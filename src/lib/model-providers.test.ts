@@ -63,13 +63,20 @@ describe("model provider catalog", () => {
     expect(getProviderForModel("openrouter/auto")).toBeUndefined();
   });
 
-  it("marks the local provider as unable to read documents", () => {
-    expect(providerReadsDocuments("local")).toBe(false);
+  it("assigns document roles to every provider, natively or via extracted text", () => {
+    expect(providerReadsDocuments("local")).toBe(true);
+    expect(providerReadsDocuments("deepseek")).toBe(true);
     expect(providerReadsDocuments("gemini")).toBe(true);
     expect(providerReadsDocuments("openrouter")).toBe(true);
     // Bilinmeyen bir sağlayıcı kimliği okuyabilir sayılır: bu bayrak bir
     // güvenlik kontrolü değil, yetenek beyanı.
     expect(providerReadsDocuments("nonexistent")).toBe(true);
+  });
+
+  it("marks local and deepseek as text-only readers (no native PDF support)", () => {
+    expect(providerCatalog.find((provider) => provider.id === "local")?.documentTextOnly).toBe(true);
+    expect(providerCatalog.find((provider) => provider.id === "deepseek")?.documentTextOnly).toBe(true);
+    expect(providerCatalog.find((provider) => provider.id === "gemini")?.documentTextOnly).toBeUndefined();
   });
 
   it("keeps the document stages exactly the ones that receive the PDF", () => {

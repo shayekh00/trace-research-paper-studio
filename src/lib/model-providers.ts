@@ -1,4 +1,4 @@
-export type ProviderId = "gemini" | "openai" | "anthropic" | "openrouter" | "local";
+export type ProviderId = "gemini" | "openai" | "anthropic" | "deepseek" | "openrouter" | "local";
 
 export type GenerationTaskRole = "evidence" | "technical" | "report" | "visual";
 
@@ -35,6 +35,12 @@ export type ProviderDefinition = {
    * göremiyor, dolayısıyla makaleyi OKUYAN aşamalar onlara verilemez.
    */
   readsDocuments?: boolean;
+  /**
+   * readsDocuments false olsa da bu sağlayıcı devre dışı kalmaz: PDF'in düz
+   * metni çıkarılıp prompta eklenir. Şekiller, tablolar ve sayfa düzeni
+   * kaybolur ama Evidence/Technical rollerine yine de atanabilir.
+   */
+  documentTextOnly?: boolean;
   hint?: string;
 };
 
@@ -70,6 +76,17 @@ export const providerCatalog: readonly ProviderDefinition[] = [
     ],
   },
   {
+    id: "deepseek",
+    label: "DeepSeek",
+    keyLabel: "DeepSeek API key",
+    documentTextOnly: true,
+    hint: "DeepSeek's API has no PDF upload endpoint. Its text is extracted and given as plain text instead — figures, tables and page layout are lost, so a paper that leans on diagrams is better read by a provider with native PDF support.",
+    models: [
+      { id: "deepseek-chat", label: "DeepSeek Chat", note: "Recommended" },
+      { id: "deepseek-reasoner", label: "DeepSeek Reasoner", note: "Deepest" },
+    ],
+  },
+  {
     id: "openrouter",
     label: "OpenRouter",
     keyLabel: "OpenRouter API key",
@@ -86,8 +103,8 @@ export const providerCatalog: readonly ProviderDefinition[] = [
     keyLabel: "Local server address",
     local: true,
     freeformModel: true,
-    readsDocuments: false,
-    hint: "Ollama, LM Studio or llama.cpp on this machine. Nothing leaves it, and no key is needed — but a local model cannot read the PDF, so the Evidence and Technical stages still need a provider that can.",
+    documentTextOnly: true,
+    hint: "Ollama, LM Studio or llama.cpp on this machine. Nothing leaves it, and no key is needed — but a local model has no file upload endpoint either, so its PDF text is extracted and given as plain text: figures, tables and page layout are lost.",
     models: [
       { id: "qwen3:8b", label: "qwen3:8b", note: "Ollama" },
       { id: "llama3.1:8b", label: "llama3.1:8b", note: "Ollama" },
@@ -100,6 +117,7 @@ export const defaultModelByProvider: Record<ProviderId, string> = {
   gemini: "gemini-3.7-flash",
   openai: "gpt-5.6-terra",
   anthropic: "claude-sonnet-4-5",
+  deepseek: "deepseek-chat",
   openrouter: "openrouter/auto",
   local: "qwen3:8b",
 };

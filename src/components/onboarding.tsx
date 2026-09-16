@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ArrowRight, BookOpen, Check, Eye, EyeOff, FileText, Link2, LockKeyhole, Plus, Sparkles, Upload, Users, X } from "lucide-react";
 import {
   createSingleModelTeam,
@@ -57,14 +57,17 @@ export function Onboarding({ onGenerate, onSample, onLibrary, libraryCount, init
   // `useSyncExternalStore` iki tarafa ayrı anlık görüntü vermenin React'teki
   // yolu. Kullanıcı seçimi bunu geçersiz kılar.
   const detectedLanguage = useSyncExternalStore(subscribeNever, readBrowserLanguage, readServerLanguage);
-  const [chosenLanguage, setLanguage] = useState<ProjectLanguage>();
-  const language = chosenLanguage ?? detectedLanguage;
+  // Varsayılan seçim sabit İngilizce; tarayıcı dili yalnızca aşağıdaki
+  // seçiciye bir kısayol olarak ekleniyor, otomatik seçilmiyor.
+  const [chosenLanguage, setLanguage] = useState<ProjectLanguage>("en");
+  const language = chosenLanguage;
   // Liste kullanıcının kendi dilini de içerir; yaygın diller yalnızca kısayol.
   const languageChoices = useMemo(() => languageOptions(detectedLanguage), [detectedLanguage]);
   const [audience, setAudience] = useState<"general" | "student" | "expert">("student");
   const [depth, setDepth] = useState<"concise" | "standard" | "deep">("standard");
-  const [provider, setProvider] = useState<ProviderId>("gemini");
-  const [model, setModel] = useState(defaultModelByProvider.gemini);
+  const [provider, setProvider] = useState<ProviderId>("deepseek");
+  const [model, setModel] = useState(defaultModelByProvider.deepseek);
+  const [serverConfiguredProviders, setServerConfiguredProviders] = useState<ProviderId[]>([]);
   const [orchestration, setOrchestration] = useState<"single" | "team">(initialTeam ? "team" : "single");
   const [team, setTeam] = useState<ModelTeam>(() => structuredClone(recommendedModelTeam));
   const [openRouterModels, setOpenRouterModels] = useState<Array<{ id: string; label: string; contextLength?: number }>>([]);
@@ -76,6 +79,20 @@ export function Onboarding({ onGenerate, onSample, onLibrary, libraryCount, init
   const usedProviders = providerCatalog.filter((item) =>
     Object.values(assignments).some((assignment) => assignment.provider === item.id),
   );
+
+  // Sunucu `.env.local` üzerinden bir sağlayıcı anahtarı zaten yapılandırdıysa
+  // o alanı hiç göstermiyoruz. Anahtarın kendisi asla buraya gelmez, yalnızca
+  // "zaten var" bayrağı — bkz. src/app/api/config/route.ts.
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/config")
+      .then((response) => response.json())
+      .then((data: { serverConfiguredProviders?: ProviderId[] }) => {
+        if (!cancelled) setServerConfiguredProviders(data.serverConfiguredProviders ?? []);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
 
   function acceptFile(nextFile?: File) {
     setError(undefined);
@@ -112,8 +129,11 @@ export function Onboarding({ onGenerate, onSample, onLibrary, libraryCount, init
   function submit() {
     if (!file) return setError("Upload a paper PDF first.");
     // Yerel sağlayıcıda "anahtar" bir adres ve boş bırakılabilir: boşsa
-    // sunucu tarafı Ollama'nın varsayılan adresini kullanıyor.
-    const missingProvider = usedProviders.find((item) => !item.local && !apiKeys[item.id]?.trim());
+    // sunucu tarafı Ollama'nın varsayılan adresini kullanıyor. Sunucu zaten
+    // bir anahtar yapılandırdıysa (`.env.local`) o alan da gösterilmiyor.
+    const missingProvider = usedProviders.find((item) =>
+      !item.local && !serverConfiguredProviders.includes(item.id) && !apiKeys[item.id]?.trim(),
+    );
     if (missingProvider) return setError(`${missingProvider.label} needs its ${missingProvider.keyLabel}.`);
     const unreadable = documentTaskRoles.find((role) => !providerReadsDocuments(assignments[role].provider));
     if (unreadable) {
@@ -260,10 +280,11 @@ export function Onboarding({ onGenerate, onSample, onLibrary, libraryCount, init
               <div className="single-model-row">
                 <div className="model-select provider-select"><select aria-label="Model provider" value={provider} onChange={(event) => changeProvider(event.target.value as ProviderId)}>{providerCatalog.map((item) => (
                   /* Tek model dört işi birden yapıyor; biri makaleyi okumak.
-                     PDF'i alamayan sağlayıcı burada seçilemez — ama model
-                     ekibinde yazı ve görsel işlerine atanabilir. */
+                     Native belge desteği olmayan sağlayıcılar PDF'in düz
+                     metnini alır (documentTextOnly) — hâlâ seçilebilir, ama
+                     şekiller ve düzen kaybolur. */
                   <option key={item.id} value={item.id} disabled={item.readsDocuments === false}>
-                    {item.label}{item.readsDocuments === false ? " · model team only" : ""}
+                    {item.label}{item.readsDocuments === false ? " · model team only" : item.documentTextOnly ? " · PDF as text only" : ""}
                   </option>
                 ))}</select></div>
                 <ModelPicker assignment={{ provider, model }} onChange={(assignment) => { setProvider(assignment.provider); setModel(assignment.model); }} openRouterModels={openRouterModels} inputId="single" />
@@ -287,9 +308,10 @@ export function Onboarding({ onGenerate, onSample, onLibrary, libraryCount, init
                         }}>{providerCatalog.map((item) => {
                           const needsDocument = documentTaskRoles.includes(task.id);
                           const blocked = needsDocument && item.readsDocuments === false;
+                          const textOnly = needsDocument && item.documentTextOnly === true;
                           return (
                             <option key={item.id} value={item.id} disabled={blocked}>
-                              {item.label}{blocked ? " · cannot read the PDF" : ""}
+                              {item.label}{blocked ? " · cannot read the PDF" : textOnly ? " · PDF as text only" : ""}
                             </option>
                           );
                         })}</select>
@@ -303,7 +325,7 @@ export function Onboarding({ onGenerate, onSample, onLibrary, libraryCount, init
 
             <div className="credential-heading"><LockKeyhole size={14} /><div><strong>Provider keys in use</strong><span>Only required for the providers you selected.</span></div></div>
             <div className="credential-grid">
-              {usedProviders.map((item) => (
+              {usedProviders.filter((item) => item.local || !serverConfiguredProviders.includes(item.id)).map((item) => (
                 /* Yerel sunucuda gizlenecek bir sır yok: istenen şey adres.
                    Onu yıldızlarla göstermek, kullanıcıyı yazdığını kontrol
                    edemez hâle getirmekten başka bir işe yaramaz. */
@@ -323,6 +345,9 @@ export function Onboarding({ onGenerate, onSample, onLibrary, libraryCount, init
             </div>
             {usedProviders.filter((item) => item.hint).map((item) => (
               <p className="provider-hint" key={item.id}><strong>{item.label}.</strong> {item.hint}</p>
+            ))}
+            {usedProviders.filter((item) => !item.local && serverConfiguredProviders.includes(item.id)).map((item) => (
+              <p className="provider-hint" key={`${item.id}-server-key`}><strong>{item.label}.</strong> Using the API key configured on the server (.env.local).</p>
             ))}
             {usedProviders.some((item) => item.id === "openrouter") && <div className="openrouter-catalog-row"><span>The catalogue lists only <code>text-only output + structured output</code> models, which are the ones safe for the Trace canvas. Image input may be supported; image-output models are excluded from StorySpec generation.</span><button onClick={loadOpenRouterModels} disabled={modelsLoading}>{modelsLoading ? "Loading…" : "Load compatible models"}</button></div>}
             <p className="key-note">Keys are sent to the backend proxy for this generation request only; nothing is stored in the browser or in the project.</p>

@@ -5,7 +5,9 @@ import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import OpenAI from "openai";
 import { z } from "zod";
 import { localUrl, resolveLocalEndpoint } from "@/lib/local-endpoint";
+import { extractPdfText } from "@/lib/pdf-text";
 import { preferredLanguage } from "@/lib/preferred-language";
+import { serverConfiguredApiKey } from "@/lib/server-provider-keys";
 import {
   evidenceCheckpointSchema,
   evidencePassIds,
@@ -71,6 +73,14 @@ const OPENROUTER_STRUCTURED_FALLBACK_MODEL = "google/gemini-3.7-flash";
 const LOCAL_MODEL_TIMEOUT_MS = 15 * 60 * 1000;
 /** Akıl yürütme belirteçleri de aynı bütçeden düşüyor; bkz. `max_tokens`. */
 const LOCAL_THINKING_BUDGET_FACTOR = 4;
+/**
+ * deepseek-reasoner, cevaba başlamadan önce uzun bir "reasoning_content"
+ * üretiyor ve bu da max_tokens bütçesinden düşüyor. Bütçe dar tutulursa
+ * model tüm bütçeyi düşünmeye harcayıp tek bir cevap karakteri üretmeden
+ * `finish_reason: "length"` ile bitiyor — sonuç boş bir cevap oluyor.
+ */
+const DEEPSEEK_REASONER_BUDGET_FACTOR = 4;
+const DEEPSEEK_REASONER_MAX_TOKENS = 65_536;
 
 type GenerationInput = {
   file: File;
@@ -416,6 +426,17 @@ async function collectOpenAiCompatibleStream(
   return text;
 }
 
+/**
+ * Native belge desteği olmayan sağlayıcılar (yerel model, DeepSeek) için:
+ * çıkarılmış PDF metnini prompta ekler. Şekiller, tablolar ve sayfa düzeni
+ * bu metinde yok — yalnızca yazı katmanı.
+ */
+function withExtractedDocumentText(prompt: string, documentText: string | undefined, includeDocument: boolean) {
+  if (!includeDocument) return prompt;
+  if (!documentText) throw new Error("The extracted PDF text could not be found.");
+  return `${prompt}\n\n--- Extracted PDF text (figures, tables and page layout are not included) ---\n${documentText}`;
+}
+
 async function assertOpenRouterModelCompatible(
   apiKey: string,
   model: string,
@@ -662,13 +683,22 @@ async function prepareProviderRuntime(
      * çalışıyor. Adres `resolveLocalEndpoint` ile zaten geri-döngüye
      * kısıtlanmış durumda.
      *
-     * Belge YOK: yerel sunucularda dosya yükleme uçnoktası yok. Bu durum
-     * isteğin başında reddediliyor; buraya bir belge isteği gelirse bu bir
-     * program hatasıdır, sessizce belgesiz devam etmek değil.
+     * Belge desteği yalnızca metin: yerel sunucularda dosya yükleme uçnoktası
+     * yok. PDF'in düz metni çıkarılıp prompta eklenir; şekiller, tablolar ve
+     * sayfa düzeni kaybolur (bkz. withExtractedDocumentText).
      */
     const endpoint = input.apiKey;
     await assertLocalServerReachable(endpoint, input.model, signal);
     markProviderActivity();
+    const documentText = input.needsDocument ? await extractPdfText(input.file) : undefined;
+    if (input.needsDocument) {
+      progress({
+        stage: "document",
+        progress: 22,
+        title: "PDF text extracted for the local model.",
+        detail: `${input.file.name} · figures and layout are not included`,
+      });
+    }
     progress({
       stage: input.taskRole === "visual" ? "story" : "evidence",
       progress: input.taskRole === "visual" ? 76 : 62,
@@ -688,9 +718,6 @@ async function prepareProviderRuntime(
         signal: requestSignal,
         onChunk,
       }) => {
-        if (includeDocument) {
-          throw new Error("A local model cannot be given the PDF; this stage should never have reached it.");
-        }
         const response = await fetch(localUrl(endpoint, "/chat/completions"), {
           method: "POST",
           signal: AbortSignal.any([requestSignal, AbortSignal.timeout(LOCAL_MODEL_TIMEOUT_MS)]),
@@ -702,7 +729,7 @@ async function prepareProviderRuntime(
           },
           body: JSON.stringify({
             model: input.model,
-            messages: [{ role: "user", content: requestPrompt }],
+            messages: [{ role: "user", content: withExtractedDocumentText(requestPrompt, documentText, includeDocument) }],
             temperature: 0.4,
             /**
              * Bulut için hesaplanmış bütçe burada yetmiyor. Yerel düşünen
@@ -819,6 +846,75 @@ async function prepareProviderRuntime(
           await assertOpenRouterModelCompatible(input.apiKey, OPENROUTER_STRUCTURED_FALLBACK_MODEL, requestSignal);
           return requestModel(OPENROUTER_STRUCTURED_FALLBACK_MODEL);
         }
+      },
+      cleanup: async () => undefined,
+    };
+  }
+
+  if (input.provider === "deepseek") {
+    /**
+     * DeepSeek'in Chat Completions uçnoktası OpenAI uyumlu; yerel/OpenRouter
+     * için yazılmış akış toplayıcı burada da çalışıyor (reasoning_content
+     * dahil). Belge desteği yalnızca metin: DeepSeek'in dosya yükleme
+     * uçnoktası yok, bu yüzden PDF'in düz metni çıkarılıp prompta eklenir
+     * (bkz. withExtractedDocumentText).
+     *
+     * deepseek-reasoner, response_format alanını reddediyor — JSON kipi
+     * yalnızca deepseek-chat için isteniyor; ikisinin de çıktısı zaten
+     * ayrıştırılıp şemaya karşı doğrulanıyor (generateValidated).
+     */
+    markProviderActivity();
+    const documentText = input.needsDocument ? await extractPdfText(input.file) : undefined;
+    if (input.needsDocument) {
+      progress({
+        stage: "document",
+        progress: 22,
+        title: "PDF text extracted for DeepSeek.",
+        detail: `${input.file.name} · figures and layout are not included`,
+      });
+    }
+    return {
+      label: "DeepSeek",
+      effectiveModel: input.model,
+      generateStructured: async ({
+        prompt: requestPrompt,
+        schema,
+        maxOutputTokens,
+        includeDocument,
+        signal: requestSignal,
+        onChunk,
+      }) => {
+        /**
+         * DeepSeek'in `response_format` mekanizması Anthropic/Gemini/OpenAI'nin
+         * aksine şemayı KENDİSİ uygulamıyor — yalnızca "bu geçerli JSON olsun"
+         * garantisi veriyor. Şemayı metne dökmezsek model doğru alanları
+         * uydurmaya çalışıyor ve Zod doğrulaması düşüyor. Bu yüzden gerçek JSON
+         * Schema, prompta metin olarak ekleniyor (aynı zamanda json_object
+         * kipinin zorunlu tuttuğu "json" kelimesini de karşılıyor).
+         */
+        const schemaInstruction = `\n\nRespond with a single JSON object that strictly matches this JSON Schema. No extra keys, no prose, no markdown code fences — the object itself, nothing else.\n\n${JSON.stringify(openAiJsonSchema(schema))}`;
+        const response = await fetch("https://api.deepseek.com/chat/completions", {
+          method: "POST",
+          signal: AbortSignal.any([requestSignal, AbortSignal.timeout(MODEL_TIMEOUT_MS)]),
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${input.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: input.model,
+            messages: [{
+              role: "user",
+              content: withExtractedDocumentText(requestPrompt, documentText, includeDocument) + schemaInstruction,
+            }],
+            temperature: 0.4,
+            max_tokens: input.model === "deepseek-reasoner"
+              ? Math.min(maxOutputTokens * DEEPSEEK_REASONER_BUDGET_FACTOR, DEEPSEEK_REASONER_MAX_TOKENS)
+              : maxOutputTokens,
+            stream: true,
+            ...(input.model === "deepseek-reasoner" ? {} : { response_format: { type: "json_object" } }),
+          }),
+        });
+        return collectOpenAiCompatibleStream(response, onChunk, "DeepSeek");
       },
       cleanup: async () => undefined,
     };
@@ -983,6 +1079,16 @@ function parseInput(form: FormData): GenerationInput {
     if (legacyKey && !apiKeys[provider]) apiKeys[provider] = legacyKey;
   } catch {
     throw new InputError("The provider API key assignment is not valid.", 400);
+  }
+  /**
+   * İstemci bir sağlayıcı için anahtar göndermediyse (alan `.env.local`
+   * zaten yapılandırıldığı için gizlendi), sunucu ortamındaki anahtara
+   * düşülür.
+   */
+  for (const assignment of Object.values(assignments)) {
+    if (apiKeys[assignment.provider]) continue;
+    const fallback = serverConfiguredApiKey(assignment.provider);
+    if (fallback) apiKeys[assignment.provider] = fallback;
   }
 
   if (!(file instanceof File)) throw new InputError("You must upload a PDF file.", 400);
