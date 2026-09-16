@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.github
+.trace
+.trace-en-maps
+plugins/**/.trace
+coverage
+*.log
+.env*
+.DS_Store
+docs
+README.md

@@ -8,6 +8,7 @@ const nextConfig: NextConfig = {
    * uygulama açılış ekranında sonsuza kadar takılıyor.
    */
   allowedDevOrigins: ["127.0.0.1", "localhost"],
+  output: "standalone",
 };
 
 export default nextConfig;
